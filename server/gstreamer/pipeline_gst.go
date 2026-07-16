@@ -96,14 +96,16 @@ func (r *gstRunner) ensureTransientState() {
 		r.subtitleSinks = make(map[int]uintptr)
 	}
 	if r.subtitleStores == nil {
-		r.subtitleStores = make(map[int]*subtitleStore)
+		stores := make(map[int]*subtitleStore)
 		if r.task.Config.Subtitles {
 			for _, track := range r.task.Probe.Tracks {
 				if supportedSubtitleTrack(track) {
-					r.subtitleStores[track.Index] = newSubtitleStore()
+					stores[track.Index] = newSubtitleStore()
 				}
 			}
 		}
+		r.subtitleStores = stores
+		r.task.setSubtitleStores(stores)
 	}
 	if r.reader != nil {
 		return
@@ -128,6 +130,7 @@ func (r *gstRunner) ensureTransientState() {
 
 func (r *gstRunner) releaseTransientState() {
 	r.reader = nil
+	r.task.setSubtitleStores(nil)
 	r.subtitleStores = nil
 	r.subtitleSinks = nil
 	_ = r.takeBusError()
@@ -707,6 +710,7 @@ func videoIsTranscoded(conf Config, probe ProbeInfo) bool {
 func (r *gstRunner) Seek(seconds float64) bool {
 	r.ensureTransientState()
 	r.discardReadySegment()
+	r.resetSubtitleProgress(seconds)
 	wasFrozen := r.IsFrozen()
 	reuse := r.pipeline != 0
 	accurate := r.task.Cue != nil
@@ -726,6 +730,7 @@ func (r *gstRunner) Seek(seconds float64) bool {
 		return false
 	}
 	r.reader.SeekReset(actualSeconds)
+	r.resetSubtitleProgress(actualSeconds)
 
 	r.frozen.Store(false)
 	r.setPosition(actualSeconds)
@@ -1226,6 +1231,11 @@ func (r *gstRunner) completeReadySegment(index int) Segment {
 	} else {
 		r.readySegment.index = 0
 	}
+	_, videoReadTo := r.task.subtitleRange(index)
+	if r.readySegment.segment.EndNS > videoReadTo {
+		videoReadTo = r.readySegment.segment.EndNS
+	}
+	r.advanceSubtitleProgress(videoReadTo)
 	return r.readySegment.segment
 }
 
@@ -1397,6 +1407,7 @@ func (r *gstRunner) startPipeline(seconds float64) (float64, error) {
 	r.bus = bus
 	r.sink = sink
 	r.subtitleSinks = subtitleSinks
+	r.resetSubtitleProgress(actualStartSeconds)
 	r.startBusWatch()
 	gstTaskDebugf(r.task, "pipeline started requested=%.3fs actual=%.3fs audio=%d", seconds, actualStartSeconds, r.audioIndex)
 	return actualStartSeconds, nil
