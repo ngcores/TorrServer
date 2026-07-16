@@ -53,11 +53,13 @@ type gstRunner struct {
 
 	reader *mp4BoxReader
 
-	pipeline       uintptr
-	bus            uintptr
-	sink           uintptr
-	subtitleSinks  map[int]uintptr
-	subtitleStores map[int]*subtitleStore
+	pipeline        uintptr
+	bus             uintptr
+	sink            uintptr
+	subtitleSinks   map[int]uintptr
+	subtitleStores  map[int]*subtitleStore
+	videoStartProbe *gstPadProbeRegistration
+	videoClipProbe  *gstPadProbeRegistration
 
 	watchMu     sync.Mutex
 	watchCancel chan struct{}
@@ -712,7 +714,7 @@ func (r *gstRunner) Seek(seconds float64) bool {
 	var actualSeconds float64
 	var err error
 	if reuse {
-		actualSeconds, err = r.reusePipeline(seconds, accurate)
+		actualSeconds, err = r.reusePipeline(seconds, accurate, pipelineStateTimeout)
 	} else {
 		r.reader.SeekReset(seconds)
 		actualSeconds, err = r.startPipeline(seconds)
@@ -735,7 +737,7 @@ func (r *gstRunner) Seek(seconds float64) bool {
 	return true
 }
 
-func (r *gstRunner) reusePipeline(seconds float64, accurate bool) (float64, error) {
+func (r *gstRunner) reusePipeline(seconds float64, accurate bool, waitTimeout time.Duration) (float64, error) {
 	if r.pipeline == 0 || r.bus == 0 || r.sink == 0 {
 		return 0, errors.New("pipeline cannot be reused")
 	}
@@ -779,8 +781,23 @@ func (r *gstRunner) reusePipeline(seconds float64, accurate bool) (float64, erro
 		flags |= gstSeekFlagAccurate
 	}
 	seekNS := int64(math.Round(seconds * 1_000_000_000))
+	if seekNS < 0 {
+		return 0, errors.New("gstreamer seek position is negative")
+	}
+	r.installVideoSeekProbes(r.pipeline, uint64(seekNS), accurate)
+	if err := gstRuntime.popBusError(r.bus, 0); err != nil {
+		return 0, err
+	}
+	gstRuntime.drainBusMessages(r.bus, gstMessageAsyncDone|gstMessageEOS)
 	if err := sendVideoSeekEvent(r.pipeline, flags, seekNS); err != nil {
 		return 0, fmt.Errorf("gstreamer seek failed while reusing pipeline: %w", err)
+	}
+	asyncDone, err := gstRuntime.waitForSeekDone(r.bus, waitTimeout)
+	if err != nil {
+		return 0, fmt.Errorf("gstreamer seek did not finish while reusing pipeline: %w", err)
+	}
+	if !asyncDone {
+		gstTaskDebugf(r.task, "seek ASYNC_DONE not observed at %.3fs; validating pipeline state", seconds)
 	}
 
 	waitResult := gstRuntime.elementGetState(r.pipeline, pipelineStateTimeout)
@@ -791,10 +808,7 @@ func (r *gstRunner) reusePipeline(seconds float64, accurate bool) (float64, erro
 		return 0, fmt.Errorf("gstreamer seek state=%d while reusing pipeline", waitResult)
 	}
 
-	actualSeconds := seconds
-	if positionNS, ok := gstRuntime.elementQueryPosition(r.pipeline); ok && positionNS >= 0 {
-		actualSeconds = float64(positionNS) / 1_000_000_000
-	}
+	actualSeconds := r.querySeekPosition(r.pipeline, seconds)
 	if err := r.setPipelineState(r.pipeline, r.bus, gstStatePlaying); err != nil {
 		return 0, fmt.Errorf("resume pipeline after seek: %w", err)
 	}
@@ -819,6 +833,15 @@ func sendVideoSeekEvent(pipeline uintptr, flags int32, positionNS int64) error {
 		return errors.New("video seek event returned false")
 	}
 	return nil
+}
+
+func (r *gstRunner) querySeekPosition(pipeline uintptr, requestedSeconds float64) float64 {
+	if positionNS, ok := gstRuntime.elementQueryPosition(pipeline); ok {
+		return float64(positionNS) / 1_000_000_000
+	}
+
+	gstTaskDebugf(r.task, "position query unavailable or invalid after seek; using requested=%.3fs", requestedSeconds)
+	return requestedSeconds
 }
 
 func (r *gstRunner) EnsureInit(ctx context.Context, audio int, startIndex int) error {
@@ -984,6 +1007,7 @@ func (r *gstRunner) pullOutputSample() (bool, error) {
 		return gstRuntime.appSinkIsEOS(r.sink), nil
 	}
 	defer gstRuntime.sampleUnref(sample)
+	r.applyPendingVideoStart()
 
 	if err := gstRuntime.withSampleBytes(sample, func(data []byte) error {
 		if len(data) == 0 {
@@ -1251,6 +1275,7 @@ func (r *gstRunner) startPipeline(seconds float64) (float64, error) {
 	actualStartSeconds := seconds
 
 	cleanup := func() {
+		r.removeVideoSeekProbes()
 		gstRuntime.elementSetState(pipeline, gstStateNull)
 		gstRuntime.objectUnref(sink)
 		gstRuntime.objectUnref(pipeline)
@@ -1270,9 +1295,28 @@ func (r *gstRunner) startPipeline(seconds float64) (float64, error) {
 		if r.task.Cue != nil {
 			flags |= gstSeekFlagAccurate
 		}
-		if err := sendVideoSeekEvent(pipeline, flags, int64(math.Round(seconds*1_000_000_000))); err != nil {
+		if err := gstRuntime.popBusError(bus, 0); err != nil {
+			cleanup()
+			return 0, err
+		}
+		gstRuntime.drainBusMessages(bus, gstMessageAsyncDone|gstMessageEOS)
+		seekNS := int64(math.Round(seconds * 1_000_000_000))
+		if seekNS < 0 {
+			cleanup()
+			return 0, errors.New("gstreamer seek position is negative")
+		}
+		r.installVideoSeekProbes(pipeline, uint64(seekNS), r.task.Cue != nil)
+		if err := sendVideoSeekEvent(pipeline, flags, seekNS); err != nil {
 			cleanup()
 			return 0, fmt.Errorf("gstreamer seek failed: %w", err)
+		}
+		asyncDone, err := gstRuntime.waitForSeekDone(bus, pipelineStateTimeout)
+		if err != nil {
+			cleanup()
+			return 0, fmt.Errorf("gstreamer seek did not finish: %w", err)
+		}
+		if !asyncDone {
+			gstTaskDebugf(r.task, "initial seek ASYNC_DONE not observed at %.3fs; validating pipeline state", seconds)
 		}
 
 		waitResult := gstRuntime.elementGetState(pipeline, pipelineStateTimeout)
@@ -1297,11 +1341,7 @@ func (r *gstRunner) startPipeline(seconds float64) (float64, error) {
 			return 0, fmt.Errorf("unexpected GstStateChangeReturn=%d after seek", waitResult)
 		}
 
-		if positionNS, ok := gstRuntime.elementQueryPosition(pipeline); ok {
-			actualStartSeconds = float64(positionNS) / 1_000_000_000.0
-		} else {
-			gstTaskDebugf(r.task, "position query unavailable after seek; using requested=%.3fs", seconds)
-		}
+		actualStartSeconds = r.querySeekPosition(pipeline, seconds)
 	}
 
 	if err := r.setPipelineState(pipeline, bus, gstStatePlaying); err != nil {
@@ -1351,6 +1391,7 @@ func (r *gstRunner) setPipelineState(pipeline uintptr, bus uintptr, state int32)
 
 func (r *gstRunner) stopPipeline() {
 	r.stopBusWatch()
+	r.removeVideoSeekProbes()
 	if r.pipeline != 0 {
 		_ = gstRuntime.elementSetState(r.pipeline, gstStateNull)
 	}
