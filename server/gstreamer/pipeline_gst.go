@@ -28,8 +28,9 @@ var (
 const (
 	defaultAACChannels   = 2
 	defaultAACSampleRate = 48000
-	pipelineReadTimeout  = 20 * time.Second
+	pipelineReadTimeout  = 45 * time.Second
 	pipelineStateTimeout = 5 * time.Second
+	pipelineEOSBackoff   = 120 * time.Second
 	gstPollInterval      = 100 * time.Millisecond
 )
 
@@ -756,8 +757,12 @@ func (r *gstRunner) reusePipeline(seconds float64, accurate bool, waitTimeout ti
 	if videoTimestamper != 0 {
 		defer gstRuntime.objectUnref(videoTimestamper)
 	}
-	videoEncoder := gstRuntime.binGetByName(r.pipeline, "video_encoder")
-	if videoEncoder != 0 {
+	var videoEncoder uintptr
+	if videoIsTranscoded(r.task.Config, r.task.Probe) {
+		videoEncoder = gstRuntime.binGetByName(r.pipeline, "video_encoder")
+		if videoEncoder == 0 {
+			return 0, errors.New("video encoder is not available for seek reset")
+		}
 		defer gstRuntime.objectUnref(videoEncoder)
 	}
 
@@ -1004,7 +1009,13 @@ func (r *gstRunner) pullOutputSample() (bool, error) {
 		if err := r.pollPipelineError(); err != nil {
 			return false, err
 		}
-		return gstRuntime.appSinkIsEOS(r.sink), nil
+		if !gstRuntime.appSinkIsEOS(r.sink) {
+			return false, nil
+		}
+		if err := r.earlyEndOfStreamError(); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
 	defer gstRuntime.sampleUnref(sample)
 	r.applyPendingVideoStart()
@@ -1074,7 +1085,40 @@ func (r *gstRunner) watchBus(bus uintptr, generation uint64, cancel <-chan struc
 			go r.freezeBusGeneration(generation)
 			return
 		}
+		if gstRuntime.popBusMessage(bus, 0, gstMessageEOS) {
+			if err := r.earlyEndOfStreamError(); err != nil {
+				gstTaskErrorf(r.task, "pipeline bus failed at %.3fs: %v", r.position(), err)
+				r.storeBusError(err)
+				go r.freezeBusGeneration(generation)
+			}
+			return
+		}
 	}
+}
+
+func (r *gstRunner) earlyEndOfStreamError() error {
+	if r.task == nil || r.task.Probe.DurationNS <= 0 {
+		return nil
+	}
+
+	durationSeconds := float64(r.task.Probe.DurationNS) / float64(time.Second)
+	thresholdSeconds := durationSeconds - pipelineEOSBackoff.Seconds()
+	if thresholdSeconds < 0 {
+		thresholdSeconds = 0
+	}
+
+	positionSeconds := r.position()
+	if !math.IsNaN(positionSeconds) && !math.IsInf(positionSeconds, 0) && positionSeconds >= thresholdSeconds {
+		return nil
+	}
+
+	return fmt.Errorf(
+		"%w: position=%.3fs threshold=%.3fs duration=%.3fs",
+		ErrEarlyEndOfStream,
+		positionSeconds,
+		thresholdSeconds,
+		durationSeconds,
+	)
 }
 
 func (r *gstRunner) freezeBusGeneration(generation uint64) {

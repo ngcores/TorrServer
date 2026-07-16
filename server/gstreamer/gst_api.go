@@ -39,7 +39,7 @@ const (
 	gstMessageAsyncDone int32 = 1 << 21
 )
 
-const maxGStreamerSampleBytes = 128 * 1024 * 1024
+const maxGStreamerSampleBytes = 256 * 1024 * 1024
 
 type gstVersionInfo struct {
 	major uint32
